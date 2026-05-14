@@ -9,7 +9,51 @@ Real data has variants: `'GE'`, `'GE MEDICAL SYSTEMS'`, `'GE Healthcare'`,
 `'GE HEALTHCARE'` should all collapse to `'GE'`. Without normalization, equality
 filters miss large fractions of relevant studies.
 
-Apply with CASE:
+**Preferred (config-driven):** If `manufacturer_encoding_config` exists in the
+catalog (Discovery Step 4 will find it), JOIN to it for manufacturer-aware
+normalization that also carries unit conversion factors and per-manufacturer
+thresholds:
+
+```sql
+-- For manufacturer grouping in analytics
+WITH mfr_config AS (
+  SELECT DISTINCT manufacturer_pattern,
+    CASE
+      WHEN manufacturer_pattern LIKE '%GE%' THEN 'GE'
+      WHEN manufacturer_pattern LIKE '%SIEMENS%' THEN 'SIEMENS'
+      WHEN manufacturer_pattern LIKE '%Philips%' THEN 'PHILIPS'
+      WHEN manufacturer_pattern LIKE '%CANON%' OR manufacturer_pattern LIKE '%TOSHIBA%' THEN 'CANON'
+      ELSE 'OTHER'
+    END AS manufacturer_group
+  FROM <catalog>.dicom_silver.manufacturer_encoding_config
+)
+SELECT s.*,
+  COALESCE(mc.manufacturer_group, s.manufacturer) AS manufacturer_normalized
+FROM <curated_surface> s
+LEFT JOIN mfr_config mc
+  ON UPPER(s.manufacturer) LIKE UPPER(mc.manufacturer_pattern)
+```
+
+For threshold queries (e.g., "thin-slice CT by manufacturer"), the config table
+carries per-manufacturer thresholds (`threshold_value`) and slice category
+boundaries (`slice_category_thin`, `slice_category_std`). This handles the
+Philips 0.80mm vs others 0.425mm difference automatically:
+
+```sql
+SELECT s.manufacturer, ec.threshold_value,
+  CASE
+    WHEN s.slice_thickness <= ec.slice_category_thin THEN 'thin'
+    WHEN s.slice_thickness <= ec.slice_category_std THEN 'standard'
+    ELSE 'thick'
+  END AS slice_category
+FROM <curated_surface> s
+JOIN <catalog>.dicom_silver.manufacturer_encoding_config ec
+  ON UPPER(s.manufacturer) LIKE UPPER(ec.manufacturer_pattern)
+  AND ec.modality = s.modality AND ec.parameter = 'slice_thickness'
+WHERE s.series_type = 'volumetric'
+```
+
+**Fallback (inline CASE):** When no config table is available:
 
 ```sql
 CASE

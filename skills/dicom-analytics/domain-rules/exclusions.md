@@ -31,14 +31,28 @@ answer.
 
 ## The exclusion
 
+**Preferred (when `series_type` column exists in the curated surface):**
+
+```sql
+WHERE series_type = 'volumetric'
+```
+
+The `series_type` column is computed from `series_type_rules` — a config-driven
+classification table (`samuels_fevm_catalog.dicom_silver.series_type_rules`).
+Values: `volumetric`, `scout`, `reformat`, `derived`, `non_volumetric`, `other`.
+This is strictly more accurate than the array check below because it also catches
+unlabeled scouts (few images + high slice thickness) and reformats (MPR/MIP).
+
+**Fallback (when `series_type` is not available):**
+
 ```sql
 WHERE NOT array_contains(image_type, 'LOCALIZER')
   AND NOT array_contains(image_type, 'SCOUT')
 ```
 
 When this rule applies, it is **non-optional**. Apply silently in generated
-queries; mention inline once when applying ("Excluding LOCALIZER and SCOUT
-series — standard for parameter analytics").
+queries; mention inline once when applying ("Excluding non-volumetric series —
+scouts, reformats, derived — standard for parameter analytics").
 
 ## Bronze fallback for image_type
 

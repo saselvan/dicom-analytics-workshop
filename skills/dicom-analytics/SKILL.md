@@ -1,16 +1,6 @@
 ---
 name: dicom-analytics
-description: |
-  Generic schema-adaptive DICOM imaging metadata analytics on Databricks. Handles
-  DICOMweb-format JSON payloads in bronze (STRING or VARIANT), discovers the user's
-  curated columns and exploration surfaces at runtime, and adapts query generation
-  to whatever silver schema exists. Encodes DICOM domain conventions once for any
-  DICOMweb workload — not specialized to any single hospital.
-when_to_use: |
-  Use when the user asks about DICOM imaging metadata — modalities, manufacturers,
-  scanner fleet, slice/acquisition parameters, study/series counts, tag exploration,
-  protocol distributions, dose compliance, scanner utilization, cohort identification,
-  or any analytics over the radiology imaging metadata layer.
+description: "Generic schema-adaptive DICOM imaging metadata analytics on Databricks. Handles DICOMweb-format JSON payloads in bronze (STRING or VARIANT), discovers the user's curated columns and exploration surfaces at runtime, and adapts query generation to whatever silver schema exists. Encodes DICOM domain conventions once for any DICOMweb workload. Use when the user asks about DICOM imaging metadata — modalities, manufacturers, scanner fleet, slice/acquisition parameters, study/series counts, tag exploration, protocol distributions, dose compliance, scanner utilization, cohort identification, or any analytics over the radiology imaging metadata layer."
 ---
 
 # DICOM Analytics

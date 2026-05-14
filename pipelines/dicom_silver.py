@@ -2,359 +2,282 @@
 DICOM Silver Pipeline — series-level curated table from instance-level bronze.
 
 Sources: bronze.dicom_raw (DICOMweb JSON payload, instance-level)
-Target:  silver.dicom_series (~30 named columns, series-level)
+Target:  dicom_series (~30 named columns, series-level)
+
+Uses the modern Spark Declarative Pipelines (SDP) Python API. All transformation
+logic is expressed as SQL — Python is used only for configuration and type detection.
+The pipeline is fully declarative: each decorated function returns a single SQL
+expression defining WHAT the table contains, not HOW to compute it.
 
 Bronze payload format (DICOMweb / QIDO-RS / WADO-RS, per DICOM PS3.18):
-  {
-    "00080060": {"vr": "CS", "Value": ["CT"]},                         # single-value
-    "00280030": {"vr": "DS", "Value": [0.648438, 0.648438]},           # multi-value DS
-    "00200032": {"vr": "DS", "Value": [-154.0, -85.0, 1585.0]},        # 3-component
-    "00080008": {"vr": "CS", "Value": ["ORIGINAL","PRIMARY","AXIAL"]}, # multi-value CS
-    "00100010": {"vr": "PN", "Value": [{"Alphabetic": "Doe^John"}]},   # PN structured
-    "00120064": {"vr": "SQ", "Value": [{...nested tag dict...}]},      # sequence
-    "00080030": {"vr": "TM"},                                          # no Value field
-    "7FE00010": {"vr": "OW", "BulkDataURI": "https://..."}             # bulk data
-  }
-
-NOTE: DICOMweb JSON uses proper JSON arrays for multi-value tags. Traditional DICOM's
-backslash-separated multi-value encoding does NOT apply here.
-
-Type-adaptive access:
-- If bronze payload column is VARIANT: use try_variant_get(...) for safe casting.
-  Backtick colon syntax (payload:`00080060`...) also works in SQL but is awkward
-  to construct programmatically; functions are cleaner here.
-- If bronze payload column is STRING: use get_json_object + try_cast.
-
-Both paths are supported; the pipeline detects payload type at module load and
-selects the appropriate sanitizer family.
-
-Pipeline context (vs ad-hoc skill):
-This pipeline does NOT use runtime schema discovery. The payload column name and
-bronze table are configured via SDP pipeline configuration parameters
-(`dicom.payload_column`, `dicom.bronze_table`) for deterministic deployment behavior.
-The dicom-analytics skill in ad-hoc mode (notebooks, SQL editor) handles unknown
-schemas via its Discovery Phase; this pipeline trusts its configuration.
+  { "00080060": {"vr": "CS", "Value": ["CT"]}, ... }
 
 Configuration parameters (set in databricks.yml or pipeline UI):
-- dicom.payload_column   (default: "dicom_payload")
-- dicom.bronze_table     (default: "bronze.dicom_raw")
+- dicom.payload_column           (default: "dicom_payload")
+- dicom.bronze_table             (default: "bronze.dicom_raw")
+- dicom.series_type_rules_table  (default: "samuels_fevm_catalog.dicom_silver.series_type_rules")
 
 To add a tag to silver:
 - Open this file in the Lakeflow Pipelines Editor.
 - Prompt Genie Code Agent mode: "add <tag_name> to the silver pipeline as <type>".
 - Genie reads dicom-analytics + databricks-spark-declarative-pipelines skills;
-  emits the edits to this file plus an entry in skills/dicom-analytics/SKILL.md's
-  curated tag dictionary.
-- Review the multi-file diff, approve, run a full refresh of the pipeline.
+  emits the SQL edits. Review the diff, approve, run a full refresh.
 
 Author: Samuel Selvan
 Account: NWM
 """
 
-import dlt
-from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, IntegerType, VariantType
+from pyspark import pipelines as dp
 
 
 # ---------------------------------------------------------------------------
-# Configuration — read from SDP pipeline parameters
+# Configuration
 # ---------------------------------------------------------------------------
 
-PAYLOAD_COL = spark.conf.get("dicom.payload_column", "dicom_payload")
-BRONZE_TABLE = spark.conf.get("dicom.bronze_table", "bronze.dicom_raw")
+PAYLOAD_COL   = spark.conf.get("dicom.payload_column", "dicom_payload")
+BRONZE_TABLE  = spark.conf.get("dicom.bronze_table", "bronze.dicom_raw")
+RULES_TABLE   = spark.conf.get("dicom.series_type_rules_table",
+                               "samuels_fevm_catalog.dicom_silver.series_type_rules")
 
-# Detect payload column type to select the appropriate sanitizer family.
-# Pipelines fail fast if the bronze table or column is missing — that's a config
-# error that should surface immediately, not silently produce wrong data.
-_bronze_schema = spark.table(BRONZE_TABLE).schema
-_payload_field = next((f for f in _bronze_schema if f.name == PAYLOAD_COL), None)
-if _payload_field is None:
-    raise ValueError(
-        f"Configured payload column '{PAYLOAD_COL}' not found in {BRONZE_TABLE}. "
-        f"Available columns: {[f.name for f in _bronze_schema]}. "
-        f"Set 'dicom.payload_column' configuration parameter to the correct column."
-    )
+# Detect payload column type — determines SQL extraction syntax.
+_payload_type = next(
+    (f.dataType.typeName() for f in spark.table(BRONZE_TABLE).schema
+     if f.name == PAYLOAD_COL), None
+)
+if _payload_type is None:
+    raise ValueError(f"Column '{PAYLOAD_COL}' not found in {BRONZE_TABLE}")
 
-PAYLOAD_IS_VARIANT = _payload_field.dataType.typeName().lower() == "variant"
-print(f"[dicom_silver] Bronze: {BRONZE_TABLE}, payload column: {PAYLOAD_COL} "
-      f"(type: {'VARIANT' if PAYLOAD_IS_VARIANT else 'STRING'})")
+IS_VARIANT = _payload_type.lower() == "variant"
 
+# Build extraction expressions based on payload type.
+# VARIANT: try_variant_get(col, '$.TAG.Value[N]', 'type')
+# STRING:  try_cast(get_json_object(col, '$.TAG.Value[N]'), type)
+def _v(tag, idx=0, typ="string"):
+    """Generate a type-adaptive extraction expression for a single tag value."""
+    if IS_VARIANT:
+        return f"try_variant_get(`{PAYLOAD_COL}`, '$.{tag}.Value[{idx}]', '{typ}')"
+    if typ == "string":
+        return f"get_json_object({PAYLOAD_COL}, '$.{tag}.Value[{idx}]')"
+    return f"try_cast(get_json_object({PAYLOAD_COL}, '$.{tag}.Value[{idx}]'), {typ})"
 
-# ---------------------------------------------------------------------------
-# Sanitizers — extract and cast tag values from the DICOMweb JSON payload.
-#
-# All take a tag_id (8-char hex like "00080060") and construct the access
-# expression internally based on the discovered payload column type.
-# ---------------------------------------------------------------------------
+def _arr(tag):
+    """Generate a type-adaptive extraction for an array-typed tag."""
+    if IS_VARIANT:
+        return f"try_variant_get(`{PAYLOAD_COL}`, '$.{tag}.Value', 'array<string>')"
+    return f"from_json(get_json_object({PAYLOAD_COL}, '$.{tag}.Value'), 'array<string>')"
 
-def ds_first(tag_id: str):
-    """Single-value DS (or first of multi-value), as DOUBLE.
-    Used for: SliceThickness, KVP, RepetitionTime, etc."""
-    if PAYLOAD_IS_VARIANT:
-        return F.expr(
-            f"try_variant_get(`{PAYLOAD_COL}`, '$.{tag_id}.Value[0]', 'double')"
-        )
-    return F.try_cast(
-        F.get_json_object(F.col(PAYLOAD_COL), f"$.{tag_id}.Value[0]"),
-        DoubleType()
-    )
-
-
-def ds_at(tag_id: str, idx: int):
-    """Multi-value DS, idx-th component, as DOUBLE.
-    Used for: PixelSpacing[row=0, col=1], ImagePositionPatient[x=0, y=1, z=2],
-              ImageOrientationPatient[row_x=0..z=5]."""
-    if PAYLOAD_IS_VARIANT:
-        return F.expr(
-            f"try_variant_get(`{PAYLOAD_COL}`, '$.{tag_id}.Value[{idx}]', 'double')"
-        )
-    return F.try_cast(
-        F.get_json_object(F.col(PAYLOAD_COL), f"$.{tag_id}.Value[{idx}]"),
-        DoubleType()
-    )
-
-
-def is_first(tag_id: str):
-    """Single IS (integer string), as INT. Used for: SeriesNumber, InstanceNumber."""
-    if PAYLOAD_IS_VARIANT:
-        return F.expr(
-            f"try_variant_get(`{PAYLOAD_COL}`, '$.{tag_id}.Value[0]', 'int')"
-        )
-    return F.try_cast(
-        F.get_json_object(F.col(PAYLOAD_COL), f"$.{tag_id}.Value[0]"),
-        IntegerType()
-    )
-
-
-def us_first(tag_id: str):
-    """US (unsigned short) — JSON number, as INT. Used for: Rows, Columns, BitsAllocated."""
-    if PAYLOAD_IS_VARIANT:
-        return F.expr(
-            f"try_variant_get(`{PAYLOAD_COL}`, '$.{tag_id}.Value[0]', 'int')"
-        )
-    return F.try_cast(
-        F.get_json_object(F.col(PAYLOAD_COL), f"$.{tag_id}.Value[0]"),
-        IntegerType()
-    )
-
-
-def da_first(tag_id: str):
-    """DA (date) — should be YYYYMMDD. Tolerates YYYY.MM.DD / YYYY-MM-DD legacy variants."""
-    if PAYLOAD_IS_VARIANT:
-        raw = F.expr(
-            f"try_variant_get(`{PAYLOAD_COL}`, '$.{tag_id}.Value[0]', 'string')"
-        )
-    else:
-        raw = F.get_json_object(F.col(PAYLOAD_COL), f"$.{tag_id}.Value[0]")
-    cleaned = F.regexp_replace(F.trim(raw), r"[\.\-/]", "")
-    return F.to_date(cleaned, "yyyyMMdd")
-
-
-def cs_first(tag_id: str):
-    """CS / LO / SH / UI / AE / AS / ST — single string value. Trims whitespace.
-    PHI-bearing string fields (PN, free-text descriptions) are NOT extracted into silver."""
-    if PAYLOAD_IS_VARIANT:
-        return F.trim(F.expr(
-            f"try_variant_get(`{PAYLOAD_COL}`, '$.{tag_id}.Value[0]', 'string')"
-        ))
-    return F.trim(
-        F.get_json_object(F.col(PAYLOAD_COL), f"$.{tag_id}.Value[0]")
-    )
-
-
-def cs_array(tag_id: str):
-    """Multi-value CS — returns ARRAY<STRING>. Used for: ImageType, etc."""
-    if PAYLOAD_IS_VARIANT:
-        # try_variant_get with array<string> target type
-        return F.expr(
-            f"try_variant_get(`{PAYLOAD_COL}`, '$.{tag_id}.Value', 'array<string>')"
-        )
-    raw = F.get_json_object(F.col(PAYLOAD_COL), f"$.{tag_id}.Value")
-    return F.from_json(raw, "array<string>")
-
-
-def pn_alphabetic(tag_id: str):
-    """PN (person name) — Alphabetic component. PN values are objects with
-    {Alphabetic, Ideographic, Phonetic}. Not used in silver (PHI), but provided for
-    bronze-layer extraction patterns if ever needed for PHI workflows."""
-    if PAYLOAD_IS_VARIANT:
-        return F.expr(
-            f"try_variant_get(`{PAYLOAD_COL}`, '$.{tag_id}.Value[0].Alphabetic', 'string')"
-        )
-    return F.get_json_object(
-        F.col(PAYLOAD_COL),
-        f"$.{tag_id}.Value[0].Alphabetic"
-    )
+def _date(tag):
+    """Generate date extraction with format normalization."""
+    raw = _v(tag, 0, "string")
+    return f"to_date(regexp_replace(trim({raw}), '[.\\\\-/]', ''), 'yyyyMMdd')"
 
 
 # ---------------------------------------------------------------------------
-# Bronze -> instance-level extracted projection
+# Bronze → instance-level extracted projection
 # ---------------------------------------------------------------------------
 
-@dlt.view(
+@dp.temporary_view(
     name="bronze_dicom_extracted",
-    comment="Bronze DICOMweb JSON projected to instance-level rows with named columns. "
-            "Source for the series-level silver aggregation. Type-adapted to the "
-            "discovered bronze payload column (VARIANT or STRING)."
+    comment="DICOMweb JSON projected to named columns. Type-adaptive to VARIANT or STRING."
 )
 def bronze_dicom_extracted():
-    return (
-        spark.read.table(BRONZE_TABLE)
-        .select(
-            # Identifiers — note: depending on Lima's bronze, these may already exist
-            # as separate columns. If so, replace these calls with direct column refs.
-            cs_first("0020000D").alias("study_instance_uid"),
-            cs_first("0020000E").alias("series_instance_uid"),
-            cs_first("00080018").alias("sop_instance_uid"),
+    return spark.sql(f"""
+    SELECT
+        -- Identifiers
+        TRIM({_v('0020000D')})  AS study_instance_uid,
+        TRIM({_v('0020000E')})  AS series_instance_uid,
+        TRIM({_v('00080018')})  AS sop_instance_uid,
 
-            # Modality / device
-            cs_first("00080060").alias("modality"),
-            cs_first("00080070").alias("manufacturer"),
-            cs_first("00081090").alias("manufacturer_model_name"),
-            cs_first("00081010").alias("station_name"),
+        -- Modality / device
+        TRIM({_v('00080060')})  AS modality,
+        TRIM({_v('00080070')})  AS manufacturer,
+        TRIM({_v('00081090')})  AS manufacturer_model_name,
+        TRIM({_v('00081010')})  AS station_name,
 
-            # Anatomy / context
-            cs_first("00180015").alias("body_part_examined"),
-            cs_first("00181030").alias("protocol_name"),
+        -- Anatomy / context
+        TRIM({_v('00180015')})  AS body_part_examined,
+        TRIM({_v('00181030')})  AS protocol_name,
 
-            # Dates
-            da_first("00080020").alias("study_date"),
-            da_first("00080021").alias("series_date"),
-            da_first("00080022").alias("acquisition_date"),
+        -- Dates
+        {_date('00080020')}     AS study_date,
+        {_date('00080021')}     AS series_date,
+        {_date('00080022')}     AS acquisition_date,
 
-            # Patient demographics (non-PHI: age string, sex code)
-            cs_first("00101010").alias("patient_age"),
-            cs_first("00100040").alias("patient_sex"),
+        -- Patient demographics (non-PHI)
+        TRIM({_v('00101010')})  AS patient_age,
+        TRIM({_v('00100040')})  AS patient_sex,
 
-            # Acquisition parameters
-            ds_first("00180050").alias("slice_thickness"),
-            ds_first("00180088").alias("spacing_between_slices"),
-            ds_first("00180060").alias("kvp"),
-            ds_first("00180080").alias("repetition_time"),
-            ds_first("00180081").alias("echo_time"),
-            ds_first("00181314").alias("flip_angle"),
-            ds_first("00180087").alias("magnetic_field_strength"),
-            # --- PRE-STAGED: Litmus test recovery (uncomment if Genie hangs) ---
-            # ds_first("00181041").alias("contrast_bolus_volume"),
+        -- Acquisition parameters
+        {_v('00180050', 0, 'double')}  AS slice_thickness,
+        {_v('00180088', 0, 'double')}  AS spacing_between_slices,
+        {_v('00180060', 0, 'double')}  AS kvp,
+        {_v('00180080', 0, 'double')}  AS repetition_time,
+        {_v('00180081', 0, 'double')}  AS echo_time,
+        {_v('00181314', 0, 'double')}  AS flip_angle,
+        {_v('00180087', 0, 'double')}  AS magnetic_field_strength,
 
-            # Multi-value DS — named component split (Value array indexing)
-            ds_at("00280030", 0).alias("pixel_spacing_row"),
-            ds_at("00280030", 1).alias("pixel_spacing_col"),
-            ds_at("00200032", 0).alias("image_position_x"),
-            ds_at("00200032", 1).alias("image_position_y"),
-            ds_at("00200032", 2).alias("image_position_z"),
+        -- Multi-value: named components
+        {_v('00280030', 0, 'double')}  AS pixel_spacing_row,
+        {_v('00280030', 1, 'double')}  AS pixel_spacing_col,
+        {_v('00200032', 0, 'double')}  AS image_position_x,
+        {_v('00200032', 1, 'double')}  AS image_position_y,
+        {_v('00200032', 2, 'double')}  AS image_position_z,
 
-            # Image
-            cs_array("00080008").alias("image_type"),
-            cs_first("00280004").alias("photometric_interpretation"),
-            us_first("00280010").alias("rows"),
-            us_first("00280011").alias("columns"),
+        -- Image
+        {_arr('00080008')}             AS image_type,
+        TRIM({_v('00280004')})         AS photometric_interpretation,
+        {_v('00280010', 0, 'int')}     AS rows_px,
+        {_v('00280011', 0, 'int')}     AS columns_px,
 
-            # Audit
-            F.col("_ingestion_timestamp").alias("_ingestion_timestamp"),
-        )
-    )
+        _ingestion_timestamp
+    FROM {BRONZE_TABLE}
+    """)
 
 
 # ---------------------------------------------------------------------------
-# Series-level silver
+# Series-level silver with config-driven series_type classification
 # ---------------------------------------------------------------------------
 
-@dlt.table(
+@dp.table(
     name="dicom_series",
-    comment="Curated series-level DICOM metadata. ~30 named columns from PS3.6. "
-            "Aggregated from instance-level bronze via first(... ignorenulls=True) "
-            "for series-constant fields. See skills/dicom-analytics/SKILL.md for the "
-            "tag dictionary, routing rules, and canonical query patterns.",
+    comment="Curated series-level DICOM metadata with config-driven series_type "
+            "classification. Aggregated from instance-level bronze.",
     table_properties={
-        "delta.enableChangeDataFeed": "false",
         "delta.autoOptimize.optimizeWrite": "true",
         "delta.autoOptimize.autoCompact": "true",
-        "delta.columnMapping.mode": "name",
     },
-    cluster_by=["modality", "study_instance_uid"],  # liquid clustering
+    cluster_by=["modality", "study_instance_uid"],
 )
 def dicom_series():
-    extracted = dlt.read("bronze_dicom_extracted")
+    return spark.sql(f"""
+    WITH series_agg AS (
+        SELECT
+            study_instance_uid,
+            series_instance_uid,
+            first_value(modality, true)                   AS modality,
+            first_value(manufacturer, true)               AS manufacturer,
+            first_value(manufacturer_model_name, true)    AS manufacturer_model_name,
+            first_value(station_name, true)               AS station_name,
+            first_value(body_part_examined, true)          AS body_part_examined,
+            first_value(protocol_name, true)              AS protocol_name,
+            first_value(study_date, true)                 AS study_date,
+            first_value(series_date, true)                AS series_date,
+            first_value(acquisition_date, true)           AS acquisition_date,
+            first_value(patient_age, true)                AS patient_age,
+            first_value(patient_sex, true)                AS patient_sex,
+            first_value(slice_thickness, true)            AS slice_thickness,
+            first_value(spacing_between_slices, true)     AS spacing_between_slices,
+            first_value(kvp, true)                        AS kvp,
+            first_value(repetition_time, true)            AS repetition_time,
+            first_value(echo_time, true)                  AS echo_time,
+            first_value(flip_angle, true)                 AS flip_angle,
+            first_value(magnetic_field_strength, true)    AS magnetic_field_strength,
+            first_value(pixel_spacing_row, true)          AS pixel_spacing_row,
+            first_value(pixel_spacing_col, true)          AS pixel_spacing_col,
+            first_value(image_position_x, true)           AS image_position_x,
+            first_value(image_position_y, true)           AS image_position_y,
+            first_value(image_position_z, true)           AS image_position_z,
+            first_value(image_type, true)                 AS image_type,
+            first_value(photometric_interpretation, true) AS photometric_interpretation,
+            first_value(rows_px, true)                    AS rows_px,
+            first_value(columns_px, true)                 AS columns_px,
+            COUNT(*)                                      AS instance_count,
+            MAX(_ingestion_timestamp)                     AS _last_ingestion_timestamp
+        FROM bronze_dicom_extracted
+        GROUP BY study_instance_uid, series_instance_uid
+    ),
 
-    return (
-        extracted
-        .groupBy("study_instance_uid", "series_instance_uid")
-        .agg(
-            # Series-constant fields: first non-null value
-            F.first("modality", ignorenulls=True).alias("modality"),
-            F.first("manufacturer", ignorenulls=True).alias("manufacturer"),
-            F.first("manufacturer_model_name", ignorenulls=True).alias("manufacturer_model_name"),
-            F.first("station_name", ignorenulls=True).alias("station_name"),
-            F.first("body_part_examined", ignorenulls=True).alias("body_part_examined"),
-            F.first("protocol_name", ignorenulls=True).alias("protocol_name"),
+    with_signals AS (
+        SELECT *,
+            CASE WHEN size(image_type) >= 3 THEN UPPER(image_type[2]) END
+                AS image_type_class
+        FROM series_agg
+    ),
 
-            F.first("study_date", ignorenulls=True).alias("study_date"),
-            F.first("series_date", ignorenulls=True).alias("series_date"),
-            F.first("acquisition_date", ignorenulls=True).alias("acquisition_date"),
-
-            F.first("patient_age", ignorenulls=True).alias("patient_age"),
-            F.first("patient_sex", ignorenulls=True).alias("patient_sex"),
-
-            F.first("slice_thickness", ignorenulls=True).alias("slice_thickness"),
-            F.first("spacing_between_slices", ignorenulls=True).alias("spacing_between_slices"),
-            F.first("kvp", ignorenulls=True).alias("kvp"),
-            F.first("repetition_time", ignorenulls=True).alias("repetition_time"),
-            F.first("echo_time", ignorenulls=True).alias("echo_time"),
-            F.first("flip_angle", ignorenulls=True).alias("flip_angle"),
-            F.first("magnetic_field_strength", ignorenulls=True).alias("magnetic_field_strength"),
-            # --- PRE-STAGED: Litmus test recovery (uncomment if Genie hangs) ---
-            # F.first("contrast_bolus_volume", ignorenulls=True).alias("contrast_bolus_volume"),
-
-            F.first("pixel_spacing_row", ignorenulls=True).alias("pixel_spacing_row"),
-            F.first("pixel_spacing_col", ignorenulls=True).alias("pixel_spacing_col"),
-            F.first("image_position_x", ignorenulls=True).alias("image_position_x"),
-            F.first("image_position_y", ignorenulls=True).alias("image_position_y"),
-            F.first("image_position_z", ignorenulls=True).alias("image_position_z"),
-
-            F.first("image_type", ignorenulls=True).alias("image_type"),
-            F.first("photometric_interpretation", ignorenulls=True).alias("photometric_interpretation"),
-            F.first("rows", ignorenulls=True).alias("rows"),
-            F.first("columns", ignorenulls=True).alias("columns"),
-
-            # Series-derived
-            F.count(F.lit(1)).alias("instance_count"),
-            F.max("_ingestion_timestamp").alias("_last_ingestion_timestamp"),
-        )
+    classified AS (
+        SELECT
+            s.series_instance_uid,
+            MIN_BY(r.series_type, r.priority) AS series_type
+        FROM with_signals s
+        JOIN {RULES_TABLE} r
+          ON (r.signal_source = 'image_type_class' AND r.match_operator = 'equals'
+              AND s.image_type_class = r.match_value)
+          OR (r.signal_source = 'image_type_class' AND r.match_operator = 'in'
+              AND array_contains(split(r.match_value, ','), s.image_type_class))
+          OR (r.signal_source = 'series_description' AND r.match_operator = 'like'
+              AND UPPER(s.protocol_name) LIKE r.match_value)
+          OR (r.signal_source = 'modality' AND r.match_operator = 'in'
+              AND array_contains(split(r.match_value, ','), s.modality))
+          OR (r.signal_source = 'modality' AND r.match_operator = 'not_in'
+              AND NOT array_contains(split(r.match_value, ','), s.modality))
+          OR (r.signal_source = 'image_count_thickness' AND r.match_operator = 'lt_and'
+              AND s.instance_count <= CAST(split(r.match_value, '[|]')[0] AS INT)
+              AND s.slice_thickness > CAST(split(r.match_value, '[|]')[1] AS DOUBLE))
+        GROUP BY s.series_instance_uid
     )
 
+    SELECT
+        s.study_instance_uid,
+        s.series_instance_uid,
+        s.modality,
+        s.manufacturer,
+        s.manufacturer_model_name,
+        s.station_name,
+        s.body_part_examined,
+        s.protocol_name,
+        s.study_date,
+        s.series_date,
+        s.acquisition_date,
+        s.patient_age,
+        s.patient_sex,
+        s.slice_thickness,
+        s.spacing_between_slices,
+        s.kvp,
+        s.repetition_time,
+        s.echo_time,
+        s.flip_angle,
+        s.magnetic_field_strength,
+        s.pixel_spacing_row,
+        s.pixel_spacing_col,
+        s.image_position_x,
+        s.image_position_y,
+        s.image_position_z,
+        s.image_type,
+        s.photometric_interpretation,
+        s.rows_px,
+        s.columns_px,
+        s.instance_count,
+        s._last_ingestion_timestamp,
+        COALESCE(c.series_type, 'other') AS series_type
+    FROM with_signals s
+    LEFT JOIN classified c ON s.series_instance_uid = c.series_instance_uid
+    """)
+
 
 # ---------------------------------------------------------------------------
-# Pipeline assertions (warn-only for v1)
-#
-# For fields that should be series-constant, log series where multiple distinct
-# values were observed. Surfaces data heterogeneity without failing the run.
+# Data quality expectations
 # ---------------------------------------------------------------------------
 
-@dlt.expect("modality_is_series_constant",
+@dp.expect("modality_is_series_constant",
             "modality_distinct_count <= 1")
-@dlt.expect("manufacturer_is_series_constant",
+@dp.expect("manufacturer_is_series_constant",
             "manufacturer_distinct_count <= 1")
-@dlt.expect("slice_thickness_is_series_constant_or_null",
+@dp.expect("slice_thickness_is_series_constant_or_null",
             "slice_thickness_distinct_count <= 1")
-@dlt.view(
+@dp.temporary_view(
     name="series_constant_violations",
-    comment="Diagnostic view — surfaces series where supposedly-constant fields "
-            "have multiple distinct values. WARN-only; pipeline does not fail."
+    comment="Surfaces series where supposedly-constant fields have multiple "
+            "distinct values. Warn-only; pipeline does not fail."
 )
 def series_constant_violations():
-    extracted = dlt.read("bronze_dicom_extracted")
-    return (
-        extracted
-        .groupBy("study_instance_uid", "series_instance_uid")
-        .agg(
-            F.countDistinct("modality").alias("modality_distinct_count"),
-            F.countDistinct("manufacturer").alias("manufacturer_distinct_count"),
-            F.countDistinct("slice_thickness").alias("slice_thickness_distinct_count"),
-        )
-        .filter(
-            (F.col("modality_distinct_count") > 1)
-            | (F.col("manufacturer_distinct_count") > 1)
-            | (F.col("slice_thickness_distinct_count") > 1)
-        )
-    )
+    return spark.sql("""
+    SELECT study_instance_uid, series_instance_uid,
+           COUNT(DISTINCT modality)        AS modality_distinct_count,
+           COUNT(DISTINCT manufacturer)    AS manufacturer_distinct_count,
+           COUNT(DISTINCT slice_thickness) AS slice_thickness_distinct_count
+    FROM bronze_dicom_extracted
+    GROUP BY study_instance_uid, series_instance_uid
+    HAVING COUNT(DISTINCT modality) > 1
+        OR COUNT(DISTINCT manufacturer) > 1
+        OR COUNT(DISTINCT slice_thickness) > 1
+    """)
